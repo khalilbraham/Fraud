@@ -1,15 +1,16 @@
 import pandas as pd
 import numpy as np
-from sklearn.tree import DecisionTreeClassifier, export_text
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import precision_score, recall_score
-import re
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.window import Window
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml.classification import DecisionTreeClassifier
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml import Pipeline
 
-class FraudRuleGenerator:
+class SparkFraudRuleGenerator:
     def __init__(self, min_score=50, max_score=70, target_precision=0.3):
         """
-        Initialize the fraud rule generator.
+        Initialize the Spark-based fraud rule generator.
         
         Parameters:
         - min_score: Lower bound of the fraud score range to analyze (default: 50)
@@ -21,405 +22,475 @@ class FraudRuleGenerator:
         self.target_precision = target_precision
         self.categorical_features = []
         self.id_features = []
-        self.encoder = None
         self.dt_model = None
+        self.feature_names = []
+        self.feature_importances = None
         self.amount_thresholds = [3000, 10000, 25000, 50000, 100000]  # Based on the example rules
         
-    def preprocess_data(self, df, categorical_features=None, id_features=None):
+        # Create or get Spark session
+        self.spark = SparkSession.builder \
+            .appName("FraudRuleGenerator") \
+            .config("spark.sql.session.timeZone", "UTC") \
+            .getOrCreate()
+        
+    def preprocess_data(self, sdf, categorical_features=None, id_features=None):
         """
-        Preprocess the data for decision tree training.
+        Preprocess the data for decision tree training using Spark.
         
         Parameters:
-        - df: DataFrame containing the fraud data
-        - categorical_features: List of categorical feature names to one-hot encode
+        - sdf: Spark DataFrame containing the fraud data
+        - categorical_features: List of categorical feature names to encode
         - id_features: List of ID-like features to handle specially
         
         Returns:
-        - Preprocessed DataFrame ready for model training
+        - Processed Spark DataFrame ready for model training
         """
-        # Make a copy to avoid modifying the original dataframe
-        processed_df = df.copy()
-        
         # Store feature types
         self.categorical_features = categorical_features or []
         self.id_features = id_features or []
         
-        # Handle ID features by creating aggregated features
-        # We'll do this BEFORE filtering to ensure we have enough data for reliable statistics
-        for id_feature in self.id_features:
-            print(f"Creating features for {id_feature}...")
+        # Register the DataFrame as a temp view for SQL queries
+        sdf.createOrReplaceTempView("transactions")
+        
+        # Create a base processed DataFrame for feature engineering
+        processed_sdf = sdf
+        
+        # Handle merchant ID features
+        if 'mch_id_trimmed' in self.id_features:
+            # Calculate merchant fraud rate
+            merchant_fraud_rate = self.spark.sql("""
+                SELECT mch_id_trimmed, 
+                       AVG(CAST(is_fraud AS DOUBLE)) AS merchant_fraud_rate,
+                       COUNT(*) AS merchant_tx_count,
+                       AVG(amount) AS merchant_avg_amount,
+                       STDDEV(amount) AS merchant_amount_std
+                FROM transactions
+                GROUP BY mch_id_trimmed
+            """)
             
-            # --- MERCHANT-SPECIFIC FEATURES ---
-            if id_feature == 'mch_id_trimmed':
-                # 1. Calculate merchant-specific fraud rates
-                mch_fraud_rate = df.groupby(id_feature)['is_fraud'].mean().reset_index()
-                mch_fraud_rate.columns = [id_feature, f'merchant_fraud_rate']
-                
-                # 2. Calculate merchant transaction volume
-                mch_count = df.groupby(id_feature).size().reset_index()
-                mch_count.columns = [id_feature, f'merchant_tx_count']
-                
-                # 3. Calculate merchant average transaction amount
-                mch_avg_amount = df.groupby(id_feature)['amount'].mean().reset_index()
-                mch_avg_amount.columns = [id_feature, f'merchant_avg_amount']
-                
-                # 4. Calculate variability in merchant transaction amounts
-                mch_std_amount = df.groupby(id_feature)['amount'].std().reset_index()
-                mch_std_amount.columns = [id_feature, f'merchant_amount_std']
-                
-                # 5. Calculate merchant fraud amount rate
-                def fraud_amount_rate(group):
-                    total_amount = group['amount'].sum()
-                    fraud_amount = group.loc[group['is_fraud'] == 1, 'amount'].sum()
-                    return fraud_amount / total_amount if total_amount > 0 else 0
-                    
-                mch_fraud_amount_rate = df.groupby(id_feature).apply(fraud_amount_rate).reset_index()
-                mch_fraud_amount_rate.columns = [id_feature, f'merchant_fraud_amount_rate']
-                
-                # 6. Calculate recent merchant fraud rate (last 30 days)
-                if 'timestamp' in df.columns:
-                    recent_df = df[df['timestamp'] >= df['timestamp'].max() - pd.Timedelta(days=30)]
-                    if not recent_df.empty:
-                        recent_fraud_rate = recent_df.groupby(id_feature)['is_fraud'].mean().reset_index()
-                        recent_fraud_rate.columns = [id_feature, f'merchant_recent_fraud_rate']
-                        processed_df = processed_df.merge(recent_fraud_rate, on=id_feature, how='left')
-                
-                # 7. Calculate merchant fraud rate by amount tier
-                for i, threshold in enumerate(self.amount_thresholds):
-                    if i == 0:
-                        # Small amounts
-                        small_amounts = df[df['amount'] <= threshold]
-                        if not small_amounts.empty:
-                            small_fraud_rate = small_amounts.groupby(id_feature)['is_fraud'].mean().reset_index()
-                            small_fraud_rate.columns = [id_feature, f'merchant_small_amount_fraud_rate']
-                            processed_df = processed_df.merge(small_fraud_rate, on=id_feature, how='left')
-                    elif i == len(self.amount_thresholds) - 1:
-                        # Large amounts
-                        large_amounts = df[df['amount'] > threshold]
-                        if not large_amounts.empty:
-                            large_fraud_rate = large_amounts.groupby(id_feature)['is_fraud'].mean().reset_index()
-                            large_fraud_rate.columns = [id_feature, f'merchant_large_amount_fraud_rate']
-                            processed_df = processed_df.merge(large_fraud_rate, on=id_feature, how='left')
-                
-                # 8. Calculate velocity metrics if timestamp is available
-                if 'timestamp' in df.columns:
-                    # Number of transactions per day
-                    df['date'] = pd.to_datetime(df['timestamp']).dt.date
-                    tx_per_day = df.groupby([id_feature, 'date']).size().reset_index()
-                    tx_per_day.columns = [id_feature, 'date', 'daily_count']
-                    
-                    # Calculate statistics on daily counts
-                    daily_stats = tx_per_day.groupby(id_feature)['daily_count'].agg(['mean', 'std', 'max']).reset_index()
-                    daily_stats.columns = [id_feature, 'merchant_daily_tx_mean', 'merchant_daily_tx_std', 'merchant_daily_tx_max']
-                    processed_df = processed_df.merge(daily_stats, on=id_feature, how='left')
-                
-                # 9. Calculate cross-device metrics if available
-                if 'device' in df.columns:
-                    device_counts = df.groupby(id_feature)['device'].nunique().reset_index()
-                    device_counts.columns = [id_feature, 'merchant_device_count']
-                    processed_df = processed_df.merge(device_counts, on=id_feature, how='left')
-                
-                # 10. Calculate merchant-country risk
-                if 'merchant_country_code' in df.columns:
-                    # Get country fraud rates
-                    country_fraud_rates = df.groupby('merchant_country_code')['is_fraud'].mean().reset_index()
-                    country_fraud_rates.columns = ['merchant_country_code', 'country_fraud_rate']
-                    
-                    # Get merchant countries
-                    merchant_countries = df[[id_feature, 'merchant_country_code']].drop_duplicates()
-                    
-                    # Merge to get country risk for each merchant
-                    merchant_country_risk = merchant_countries.merge(country_fraud_rates, on='merchant_country_code', how='left')
-                    merchant_country_risk = merchant_country_risk[[id_feature, 'country_fraud_rate']]
-                    merchant_country_risk.columns = [id_feature, 'merchant_country_risk']
-                    
-                    processed_df = processed_df.merge(merchant_country_risk, on=id_feature, how='left')
-                
-                # Merge all merchant features back to the processed dataframe
-                processed_df = processed_df.merge(mch_fraud_rate, on=id_feature, how='left')
-                processed_df = processed_df.merge(mch_count, on=id_feature, how='left')
-                processed_df = processed_df.merge(mch_avg_amount, on=id_feature, how='left')
-                processed_df = processed_df.merge(mch_std_amount, on=id_feature, how='left')
-                processed_df = processed_df.merge(mch_fraud_amount_rate, on=id_feature, how='left')
-                
-                # Create merchant risk tiers based on fraud rate percentiles
-                fraud_rate_col = 'merchant_fraud_rate'
-                # Fill NaN with 0 for the bucketing
-                processed_df[fraud_rate_col] = processed_df[fraud_rate_col].fillna(0)
-                
-                # Create risk tiers (low, medium, high, very high)
+            # Calculate merchant fraud amount rate
+            merchant_fraud_amount = self.spark.sql("""
+                SELECT mch_id_trimmed,
+                       SUM(CASE WHEN is_fraud = 1 THEN amount ELSE 0 END) / SUM(amount) AS merchant_fraud_amount_rate
+                FROM transactions
+                GROUP BY mch_id_trimmed
+            """)
+            
+            # Calculate small amount fraud rate
+            merchant_small_fraud = self.spark.sql(f"""
+                SELECT mch_id_trimmed,
+                       AVG(CAST(is_fraud AS DOUBLE)) AS merchant_small_amount_fraud_rate
+                FROM transactions
+                WHERE amount <= {self.amount_thresholds[0]}
+                GROUP BY mch_id_trimmed
+            """)
+            
+            # Calculate large amount fraud rate
+            merchant_large_fraud = self.spark.sql(f"""
+                SELECT mch_id_trimmed,
+                       AVG(CAST(is_fraud AS DOUBLE)) AS merchant_large_amount_fraud_rate
+                FROM transactions
+                WHERE amount > {self.amount_thresholds[-1]}
+                GROUP BY mch_id_trimmed
+            """)
+            
+            # Join merchant metrics to the processed DataFrame
+            processed_sdf = processed_sdf.join(merchant_fraud_rate, on="mch_id_trimmed", how="left")
+            processed_sdf = processed_sdf.join(merchant_fraud_amount, on="mch_id_trimmed", how="left")
+            processed_sdf = processed_sdf.join(merchant_small_fraud, on="mch_id_trimmed", how="left")
+            processed_sdf = processed_sdf.join(merchant_large_fraud, on="mch_id_trimmed", how="left")
+            
+            # Create merchant risk tiers - We'll use Spark's UDF for this
+            # First, collect distinct fraud rates to calculate percentiles (small operation)
+            merchant_rates = merchant_fraud_rate.select("merchant_fraud_rate").distinct().collect()
+            merchant_rates = [row["merchant_fraud_rate"] for row in merchant_rates if row["merchant_fraud_rate"] is not None]
+            
+            if merchant_rates:
                 percentiles = [0, 50, 90, 95, 100]
-                labels = ['low', 'medium', 'high', 'very_high']
-                bins = np.percentile(processed_df[fraud_rate_col].unique(), percentiles)
-                # Ensure bins are unique
+                bins = np.percentile(merchant_rates, percentiles)
                 bins = np.unique(bins)
-                if len(bins) >= 2:  # Need at least 2 bins to categorize
-                    processed_df['merchant_risk_tier'] = pd.cut(
-                        processed_df[fraud_rate_col], 
-                        bins=bins, 
-                        labels=labels[:len(bins)-1],
-                        include_lowest=True
-                    )
-                    # One-hot encode the risk tier
-                    risk_dummies = pd.get_dummies(
-                        processed_df['merchant_risk_tier'], 
-                        prefix='merchant_risk'
-                    )
-                    processed_df = pd.concat([processed_df, risk_dummies], axis=1)
-                    processed_df.drop('merchant_risk_tier', axis=1, inplace=True)
+                
+                # Define a UDF to assign risk tiers
+                def assign_merchant_risk_tier(fraud_rate):
+                    if fraud_rate is None:
+                        return "unknown"
+                    for i in range(1, len(bins)):
+                        if fraud_rate <= bins[i]:
+                            if i == 1:
+                                return "low"
+                            elif i == 2:
+                                return "medium"
+                            elif i == 3:
+                                return "high"
+                            else:
+                                return "very_high"
+                    return "unknown"
+                
+                # Register the UDF
+                assign_merchant_risk_tier_udf = F.udf(assign_merchant_risk_tier)
+                
+                # Apply the UDF to create risk tiers
+                processed_sdf = processed_sdf.withColumn(
+                    "merchant_risk_tier", 
+                    assign_merchant_risk_tier_udf(F.col("merchant_fraud_rate"))
+                )
+                
+                # One-hot encode the risk tier
+                indexer = StringIndexer(
+                    inputCol="merchant_risk_tier", 
+                    outputCol="merchant_risk_tier_idx",
+                    handleInvalid="keep"
+                )
+                encoder = OneHotEncoder(
+                    inputCols=["merchant_risk_tier_idx"],
+                    outputCols=["merchant_risk_tier_enc"]
+                )
+                
+                pipeline = Pipeline(stages=[indexer, encoder])
+                processed_sdf = pipeline.fit(processed_sdf).transform(processed_sdf)
+                
+                # Drop the intermediate columns
+                processed_sdf = processed_sdf.drop("merchant_risk_tier", "merchant_risk_tier_idx")
             
-            # --- ISSUER-SPECIFIC FEATURES ---
-            elif id_feature == 'issuer_member':
-                # 1. Calculate issuer-specific fraud rates
-                issuer_fraud_rate = df.groupby(id_feature)['is_fraud'].mean().reset_index()
-                issuer_fraud_rate.columns = [id_feature, f'issuer_fraud_rate']
+            # Drop the original merchant ID
+            processed_sdf = processed_sdf.drop("mch_id_trimmed")
+        
+        # Handle issuer ID features
+        if 'issuer_member' in self.id_features:
+            # Calculate issuer fraud rate
+            issuer_fraud_rate = self.spark.sql("""
+                SELECT issuer_member, 
+                       AVG(CAST(is_fraud AS DOUBLE)) AS issuer_fraud_rate,
+                       COUNT(*) AS issuer_tx_count,
+                       AVG(amount) AS issuer_avg_amount,
+                       STDDEV(amount) AS issuer_amount_std
+                FROM transactions
+                GROUP BY issuer_member
+            """)
+            
+            # Calculate issuer fraud amount rate
+            issuer_fraud_amount = self.spark.sql("""
+                SELECT issuer_member,
+                       SUM(CASE WHEN is_fraud = 1 THEN amount ELSE 0 END) / SUM(amount) AS issuer_fraud_amount_rate
+                FROM transactions
+                GROUP BY issuer_member
+            """)
+            
+            # Calculate issuer auth rate if available
+            if "trans_status" in sdf.columns:
+                issuer_auth_rate = self.spark.sql("""
+                    SELECT issuer_member,
+                           AVG(CASE WHEN trans_status = 'Y' THEN 1.0 ELSE 0.0 END) AS issuer_auth_rate
+                    FROM transactions
+                    GROUP BY issuer_member
+                """)
+                processed_sdf = processed_sdf.join(issuer_auth_rate, on="issuer_member", how="left")
+            
+            # Calculate issuer 3DS usage rate if available
+            if "three_ds_mode" in sdf.columns:
+                issuer_3ds_rate = self.spark.sql("""
+                    SELECT issuer_member,
+                           AVG(CASE WHEN three_ds_mode != 'N' THEN 1.0 ELSE 0.0 END) AS issuer_3ds_usage_rate
+                    FROM transactions
+                    GROUP BY issuer_member
+                """)
+                processed_sdf = processed_sdf.join(issuer_3ds_rate, on="issuer_member", how="left")
+            
+            # Calculate cross-border metrics if available
+            if "issuer_bin_profile_issuing_cou" in sdf.columns and "merchant_country_code" in sdf.columns:
+                # First add is_cross_border column
+                processed_sdf = processed_sdf.withColumn(
+                    "is_cross_border",
+                    F.when(F.col("issuer_bin_profile_issuing_cou") != F.col("merchant_country_code"), 1).otherwise(0)
+                )
                 
-                # 2. Calculate issuer transaction volume
-                issuer_count = df.groupby(id_feature).size().reset_index()
-                issuer_count.columns = [id_feature, f'issuer_tx_count']
-                
-                # 3. Calculate issuer average transaction amount
-                issuer_avg_amount = df.groupby(id_feature)['amount'].mean().reset_index()
-                issuer_avg_amount.columns = [id_feature, f'issuer_avg_amount']
-                
-                # 4. Calculate variability in issuer transaction amounts
-                issuer_std_amount = df.groupby(id_feature)['amount'].std().reset_index()
-                issuer_std_amount.columns = [id_feature, f'issuer_amount_std']
-                
-                # 5. Calculate issuer fraud amount rate
-                def fraud_amount_rate(group):
-                    total_amount = group['amount'].sum()
-                    fraud_amount = group.loc[group['is_fraud'] == 1, 'amount'].sum()
-                    return fraud_amount / total_amount if total_amount > 0 else 0
-                    
-                issuer_fraud_amount_rate = df.groupby(id_feature).apply(fraud_amount_rate).reset_index()
-                issuer_fraud_amount_rate.columns = [id_feature, f'issuer_fraud_amount_rate']
-                
-                # 6. Calculate issuer authorization rate (if available)
-                if 'trans_status' in df.columns:
-                    auth_rate = df.groupby(id_feature).apply(
-                        lambda x: (x['trans_status'] == 'Y').mean()
-                    ).reset_index()
-                    auth_rate.columns = [id_feature, 'issuer_auth_rate']
-                    processed_df = processed_df.merge(auth_rate, on=id_feature, how='left')
-                
-                # 7. Calculate issuer-country metrics (if available)
-                if 'issuer_bin_profile_issuing_cou' in df.columns:
-                    # Issuer country fraud rates
-                    country_fraud_rates = df.groupby('issuer_bin_profile_issuing_cou')['is_fraud'].mean().reset_index()
-                    country_fraud_rates.columns = ['issuer_bin_profile_issuing_cou', 'issuer_country_fraud_rate']
-                    
-                    # Get issuer countries 
-                    issuer_countries = df[[id_feature, 'issuer_bin_profile_issuing_cou']].drop_duplicates()
-                    
-                    # Merge to get country risk for each issuer
-                    issuer_country_risk = issuer_countries.merge(
-                        country_fraud_rates, 
-                        on='issuer_bin_profile_issuing_cou', 
-                        how='left'
-                    )
-                    issuer_country_risk = issuer_country_risk[[id_feature, 'issuer_country_fraud_rate']]
-                    
-                    processed_df = processed_df.merge(issuer_country_risk, on=id_feature, how='left')
-                
-                # 8. Calculate 3DS usage rate by issuer (if available)
-                if 'three_ds_mode' in df.columns:
-                    threeds_rate = df.groupby(id_feature).apply(
-                        lambda x: (x['three_ds_mode'] != 'N').mean()
-                    ).reset_index()
-                    threeds_rate.columns = [id_feature, 'issuer_3ds_usage_rate']
-                    processed_df = processed_df.merge(threeds_rate, on=id_feature, how='left')
-                
-                # 9. Calculate cross-border transaction metrics
-                if 'issuer_bin_profile_issuing_cou' in df.columns and 'merchant_country_code' in df.columns:
-                    df['is_cross_border'] = (df['issuer_bin_profile_issuing_cou'] != df['merchant_country_code']).astype(int)
-                    cross_border_rate = df.groupby(id_feature)['is_cross_border'].mean().reset_index()
-                    cross_border_rate.columns = [id_feature, 'issuer_cross_border_rate'] 
-                    
-                    # Cross-border fraud rate
-                    cross_border_fraud = df[df['is_cross_border'] == 1].groupby(id_feature)['is_fraud'].mean().reset_index()
-                    cross_border_fraud.columns = [id_feature, 'issuer_cross_border_fraud_rate']
-                    
-                    processed_df = processed_df.merge(cross_border_rate, on=id_feature, how='left')
-                    processed_df = processed_df.merge(cross_border_fraud, on=id_feature, how='left')
-                
-                # Merge all issuer features back to the processed dataframe
-                processed_df = processed_df.merge(issuer_fraud_rate, on=id_feature, how='left')
-                processed_df = processed_df.merge(issuer_count, on=id_feature, how='left')
-                processed_df = processed_df.merge(issuer_avg_amount, on=id_feature, how='left')
-                processed_df = processed_df.merge(issuer_std_amount, on=id_feature, how='left')
-                processed_df = processed_df.merge(issuer_fraud_amount_rate, on=id_feature, how='left')
-                
-                # Create issuer risk tiers based on fraud rate percentiles
-                fraud_rate_col = 'issuer_fraud_rate'
-                # Fill NaN with 0 for the bucketing
-                processed_df[fraud_rate_col] = processed_df[fraud_rate_col].fillna(0)
-                
-                # Create risk tiers (low, medium, high, very high)
+                # Calculate cross-border rates
+                issuer_cross_border = self.spark.sql("""
+                    SELECT issuer_member,
+                           AVG(CAST(is_cross_border AS DOUBLE)) AS issuer_cross_border_rate,
+                           AVG(CASE WHEN is_cross_border = 1 THEN CAST(is_fraud AS DOUBLE) ELSE NULL END) 
+                               AS issuer_cross_border_fraud_rate
+                    FROM transactions
+                    GROUP BY issuer_member
+                """)
+                processed_sdf = processed_sdf.join(issuer_cross_border, on="issuer_member", how="left")
+            
+            # Join issuer metrics to the processed DataFrame
+            processed_sdf = processed_sdf.join(issuer_fraud_rate, on="issuer_member", how="left")
+            processed_sdf = processed_sdf.join(issuer_fraud_amount, on="issuer_member", how="left")
+            
+            # Create issuer risk tiers
+            issuer_rates = issuer_fraud_rate.select("issuer_fraud_rate").distinct().collect()
+            issuer_rates = [row["issuer_fraud_rate"] for row in issuer_rates if row["issuer_fraud_rate"] is not None]
+            
+            if issuer_rates:
                 percentiles = [0, 50, 90, 95, 100]
-                labels = ['low', 'medium', 'high', 'very_high']
-                bins = np.percentile(processed_df[fraud_rate_col].unique(), percentiles)
-                # Ensure bins are unique
+                bins = np.percentile(issuer_rates, percentiles)
                 bins = np.unique(bins)
-                if len(bins) >= 2:  # Need at least 2 bins to categorize
-                    processed_df['issuer_risk_tier'] = pd.cut(
-                        processed_df[fraud_rate_col], 
-                        bins=bins, 
-                        labels=labels[:len(bins)-1],
-                        include_lowest=True
-                    )
-                    # One-hot encode the risk tier
-                    risk_dummies = pd.get_dummies(
-                        processed_df['issuer_risk_tier'], 
-                        prefix='issuer_risk'
-                    )
-                    processed_df = pd.concat([processed_df, risk_dummies], axis=1)
-                    processed_df.drop('issuer_risk_tier', axis=1, inplace=True)
+                
+                # Define a UDF to assign risk tiers
+                def assign_issuer_risk_tier(fraud_rate):
+                    if fraud_rate is None:
+                        return "unknown"
+                    for i in range(1, len(bins)):
+                        if fraud_rate <= bins[i]:
+                            if i == 1:
+                                return "low"
+                            elif i == 2:
+                                return "medium"
+                            elif i == 3:
+                                return "high"
+                            else:
+                                return "very_high"
+                    return "unknown"
+                
+                # Register the UDF
+                assign_issuer_risk_tier_udf = F.udf(assign_issuer_risk_tier)
+                
+                # Apply the UDF to create risk tiers
+                processed_sdf = processed_sdf.withColumn(
+                    "issuer_risk_tier", 
+                    assign_issuer_risk_tier_udf(F.col("issuer_fraud_rate"))
+                )
+                
+                # One-hot encode the risk tier
+                indexer = StringIndexer(
+                    inputCol="issuer_risk_tier", 
+                    outputCol="issuer_risk_tier_idx",
+                    handleInvalid="keep"
+                )
+                encoder = OneHotEncoder(
+                    inputCols=["issuer_risk_tier_idx"],
+                    outputCols=["issuer_risk_tier_enc"]
+                )
+                
+                pipeline = Pipeline(stages=[indexer, encoder])
+                processed_sdf = pipeline.fit(processed_sdf).transform(processed_sdf)
+                
+                # Drop the intermediate columns
+                processed_sdf = processed_sdf.drop("issuer_risk_tier", "issuer_risk_tier_idx")
             
-            # --- GENERAL ID FEATURES (for any other ID features) ---
+            # Drop the original issuer ID
+            processed_sdf = processed_sdf.drop("issuer_member")
+        
+        # Handle other ID features generically
+        for id_feature in [f for f in self.id_features if f not in ["mch_id_trimmed", "issuer_member"]]:
+            # Calculate basic metrics
+            id_metrics = self.spark.sql(f"""
+                SELECT {id_feature}, 
+                       AVG(CAST(is_fraud AS DOUBLE)) AS {id_feature}_fraud_rate,
+                       COUNT(*) AS {id_feature}_tx_count,
+                       AVG(amount) AS {id_feature}_avg_amount,
+                       STDDEV(amount) AS {id_feature}_std_amount,
+                       SUM(CASE WHEN is_fraud = 1 THEN amount ELSE 0 END) / SUM(amount) AS {id_feature}_fraud_amount_rate
+                FROM transactions
+                GROUP BY {id_feature}
+            """)
+            
+            # Join to processed DataFrame
+            processed_sdf = processed_sdf.join(id_metrics, on=id_feature, how="left")
+            
+            # Create risk tiers
+            id_rates = id_metrics.select(f"{id_feature}_fraud_rate").distinct().collect()
+            id_rates = [row[f"{id_feature}_fraud_rate"] for row in id_rates if row[f"{id_feature}_fraud_rate"] is not None]
+            
+            if id_rates:
+                percentiles = [0, 50, 90, 95, 100]
+                bins = np.percentile(id_rates, percentiles)
+                bins = np.unique(bins)
+                
+                # Define a UDF to assign risk tiers
+                def assign_risk_tier(fraud_rate):
+                    if fraud_rate is None:
+                        return "unknown"
+                    for i in range(1, len(bins)):
+                        if fraud_rate <= bins[i]:
+                            if i == 1:
+                                return "low"
+                            elif i == 2:
+                                return "medium"
+                            elif i == 3:
+                                return "high"
+                            else:
+                                return "very_high"
+                    return "unknown"
+                
+                # Register the UDF
+                assign_risk_tier_udf = F.udf(assign_risk_tier)
+                
+                # Apply the UDF to create risk tiers
+                processed_sdf = processed_sdf.withColumn(
+                    f"{id_feature}_risk_tier", 
+                    assign_risk_tier_udf(F.col(f"{id_feature}_fraud_rate"))
+                )
+                
+                # One-hot encode the risk tier
+                indexer = StringIndexer(
+                    inputCol=f"{id_feature}_risk_tier", 
+                    outputCol=f"{id_feature}_risk_tier_idx",
+                    handleInvalid="keep"
+                )
+                encoder = OneHotEncoder(
+                    inputCols=[f"{id_feature}_risk_tier_idx"],
+                    outputCols=[f"{id_feature}_risk_tier_enc"]
+                )
+                
+                pipeline = Pipeline(stages=[indexer, encoder])
+                processed_sdf = pipeline.fit(processed_sdf).transform(processed_sdf)
+                
+                # Drop the intermediate columns
+                processed_sdf = processed_sdf.drop(f"{id_feature}_risk_tier", f"{id_feature}_risk_tier_idx")
+            
+            # Drop the original ID feature
+            processed_sdf = processed_sdf.drop(id_feature)
+        
+        # Handle categorical features
+        string_indexers = []
+        one_hot_encoders = []
+        output_cols = []
+        
+        for feature in self.categorical_features:
+            # Check cardinality first
+            distinct_count = sdf.select(feature).distinct().count()
+            
+            if distinct_count <= 50:  # Reasonable threshold for one-hot encoding
+                indexer_output = f"{feature}_index"
+                encoder_output = f"{feature}_vec"
+                
+                string_indexers.append(
+                    StringIndexer(
+                        inputCol=feature,
+                        outputCol=indexer_output,
+                        handleInvalid="keep"
+                    )
+                )
+                
+                one_hot_encoders.append(
+                    OneHotEncoder(
+                        inputCols=[indexer_output],
+                        outputCols=[encoder_output]
+                    )
+                )
+                
+                output_cols.append(encoder_output)
             else:
-                # 1. Calculate overall fraud rate per ID
-                id_fraud_rate = df.groupby(id_feature)['is_fraud'].mean().reset_index()
-                id_fraud_rate.columns = [id_feature, f'{id_feature}_fraud_rate']
+                # For high cardinality features, use frequency encoding
+                feature_freq = self.spark.sql(f"""
+                    SELECT {feature}, COUNT(*) / (SELECT COUNT(*) FROM transactions) AS {feature}_freq
+                    FROM transactions
+                    GROUP BY {feature}
+                """)
                 
-                # 2. Calculate transaction count per ID (volume indicator)
-                id_count = df.groupby(id_feature).size().reset_index()
-                id_count.columns = [id_feature, f'{id_feature}_count']
+                # Join to processed DataFrame
+                processed_sdf = processed_sdf.join(feature_freq, on=feature, how="left")
                 
-                # 3. Calculate average transaction amount per ID
-                id_avg_amount = df.groupby(id_feature)['amount'].mean().reset_index()
-                id_avg_amount.columns = [id_feature, f'{id_feature}_avg_amount']
-                
-                # 4. Calculate the standard deviation of amounts per ID (variability indicator)
-                id_std_amount = df.groupby(id_feature)['amount'].std().reset_index()
-                id_std_amount.columns = [id_feature, f'{id_feature}_std_amount']
-                
-                # 5. Calculate fraud amount rate
-                def fraud_amount_rate(group):
-                    total_amount = group['amount'].sum()
-                    fraud_amount = group.loc[group['is_fraud'] == 1, 'amount'].sum()
-                    return fraud_amount / total_amount if total_amount > 0 else 0
-                    
-                id_fraud_amount_rate = df.groupby(id_feature).apply(fraud_amount_rate).reset_index()
-                id_fraud_amount_rate.columns = [id_feature, f'{id_feature}_fraud_amount_rate']
-                
-                # Merge all features back to the processed dataframe
-                processed_df = processed_df.merge(id_fraud_rate, on=id_feature, how='left')
-                processed_df = processed_df.merge(id_count, on=id_feature, how='left')
-                processed_df = processed_df.merge(id_avg_amount, on=id_feature, how='left')
-                processed_df = processed_df.merge(id_std_amount, on=id_feature, how='left')
-                processed_df = processed_df.merge(id_fraud_amount_rate, on=id_feature, how='left')
-                
-                # Create risk tiers based on fraud rate percentiles
-                fraud_rate_col = f'{id_feature}_fraud_rate'
-                # Fill NaN with 0 for the bucketing
-                processed_df[fraud_rate_col] = processed_df[fraud_rate_col].fillna(0)
-                
-                # Create risk tiers (low, medium, high, very high)
-                percentiles = [0, 50, 90, 95, 100]
-                labels = ['low', 'medium', 'high', 'very_high']
-                bins = np.percentile(processed_df[fraud_rate_col].unique(), percentiles)
-                # Ensure bins are unique
-                bins = np.unique(bins)
-                if len(bins) >= 2:  # Need at least 2 bins to categorize
-                    processed_df[f'{id_feature}_risk_tier'] = pd.cut(
-                        processed_df[fraud_rate_col], 
-                        bins=bins, 
-                        labels=labels[:len(bins)-1],
-                        include_lowest=True
-                    )
-                    # One-hot encode the risk tier
-                    risk_dummies = pd.get_dummies(
-                        processed_df[f'{id_feature}_risk_tier'], 
-                        prefix=f'{id_feature}_risk'
-                    )
-                    processed_df = pd.concat([processed_df, risk_dummies], axis=1)
-                    processed_df.drop(f'{id_feature}_risk_tier', axis=1, inplace=True)
+                # Drop the original categorical feature
+                processed_sdf = processed_sdf.drop(feature)
+        
+        # Apply the categorical encoding pipeline if needed
+        if string_indexers and one_hot_encoders:
+            categorical_pipeline = Pipeline(stages=string_indexers + one_hot_encoders)
+            processed_sdf = categorical_pipeline.fit(processed_sdf).transform(processed_sdf)
             
-            # Drop the original ID feature as we now have more meaningful features
-            processed_df.drop(id_feature, axis=1, inplace=True)
-        
-        # Now filter transactions with scores in the target range
-        mask = (processed_df['fraud_score'] >= self.min_score) & (processed_df['fraud_score'] < self.max_score)
-        processed_df = processed_df[mask].copy()
-        
-        # One-hot encode categorical features (but with a limited cardinality check)
-        if self.categorical_features:
-            safe_categorical_features = []
+            # Drop the original categorical features and intermediate indexed columns
             for feature in self.categorical_features:
-                # Only one-hot encode if cardinality is reasonably low
-                if processed_df[feature].nunique() <= 50:  # Arbitrary threshold, adjust as needed
-                    safe_categorical_features.append(feature)
-                else:
-                    print(f"Warning: Feature {feature} has high cardinality ({processed_df[feature].nunique()} values). "
-                          f"Converting to frequency encoding instead of one-hot.")
-                    # Use frequency encoding for high cardinality categoricals
-                    value_counts = processed_df[feature].value_counts(normalize=True)
-                    processed_df[f'{feature}_freq'] = processed_df[feature].map(value_counts)
-                    processed_df.drop(feature, axis=1, inplace=True)
-            
-            if safe_categorical_features:
-                self.encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                encoded_features = self.encoder.fit_transform(processed_df[safe_categorical_features])
-                feature_names = self.encoder.get_feature_names_out(safe_categorical_features)
+                if feature in processed_sdf.columns:
+                    processed_sdf = processed_sdf.drop(feature)
                 
-                # Create a DataFrame with the encoded features
-                encoded_df = pd.DataFrame(encoded_features, columns=feature_names, index=processed_df.index)
-                
-                # Drop the original categorical features and join the encoded ones
-                processed_df = processed_df.drop(safe_categorical_features, axis=1)
-                processed_df = pd.concat([processed_df, encoded_df], axis=1)
+                indexer_output = f"{feature}_index"
+                if indexer_output in processed_sdf.columns:
+                    processed_sdf = processed_sdf.drop(indexer_output)
+        
+        # Add amount range features for decision tree
+        for i, threshold in enumerate(self.amount_thresholds):
+            if i == 0:
+                processed_sdf = processed_sdf.withColumn(
+                    f"amount_range_{i}",
+                    F.when(F.col("amount") <= threshold, 1.0).otherwise(0.0)
+                )
+            elif i == len(self.amount_thresholds):
+                processed_sdf = processed_sdf.withColumn(
+                    f"amount_range_{i}",
+                    F.when(F.col("amount") > self.amount_thresholds[i-1], 1.0).otherwise(0.0)
+                )
+            else:
+                processed_sdf = processed_sdf.withColumn(
+                    f"amount_range_{i}",
+                    F.when(
+                        (F.col("amount") > self.amount_thresholds[i-1]) & 
+                        (F.col("amount") <= threshold),
+                        1.0
+                    ).otherwise(0.0)
+                )
+        
+        # Filter transactions with scores in the target range
+        processed_sdf = processed_sdf.filter(
+            (F.col("fraud_score") >= self.min_score) & 
+            (F.col("fraud_score") < self.max_score)
+        )
         
         # Fill NaN values
-        processed_df = processed_df.fillna(-1)
+        for column in processed_sdf.columns:
+            processed_sdf = processed_sdf.withColumn(
+                column,
+                F.when(F.col(column).isNull(), -1).otherwise(F.col(column))
+            )
         
-        return processed_df
+        return processed_sdf
     
-    def train_model(self, X, y, amount_col='amount', max_depth=5):
+    def train_model(self, sdf, label_col="is_fraud", amount_col="amount", max_depth=5):
         """
-        Train a decision tree model to identify fraudulent transactions.
+        Train a decision tree model using Spark ML.
         
         Parameters:
-        - X: Feature DataFrame
-        - y: Target Series (is_fraud)
+        - sdf: Processed Spark DataFrame
+        - label_col: Name of the target column
         - amount_col: Name of the column containing transaction amounts
         - max_depth: Maximum depth of the decision tree
         
         Returns:
         - Trained decision tree model
         """
-        # Add amount range features based on thresholds
-        X_with_ranges = X.copy()
-        for i in range(len(self.amount_thresholds) + 1):
-            if i == 0:
-                X_with_ranges[f'amount_range_{i}'] = (X[amount_col] <= self.amount_thresholds[i])
-            elif i == len(self.amount_thresholds):
-                X_with_ranges[f'amount_range_{i}'] = (X[amount_col] > self.amount_thresholds[i-1])
-            else:
-                X_with_ranges[f'amount_range_{i}'] = ((X[amount_col] > self.amount_thresholds[i-1]) & 
-                                                     (X[amount_col] <= self.amount_thresholds[i]))
+        # Create a list of features to use (excluding the label and amount)
+        feature_cols = [col for col in sdf.columns if col != label_col and col != amount_col]
+        self.feature_names = feature_cols
         
-        # Remove the amount column to avoid redundancy
-        X_model = X_with_ranges.drop(amount_col, axis=1)
+        # Create a vector assembler for the features
+        assembler = VectorAssembler(
+            inputCols=feature_cols,
+            outputCol="features",
+            handleInvalid="keep"
+        )
         
-        # Train the decision tree
-        self.dt_model = DecisionTreeClassifier(max_depth=max_depth, 
-                                             min_samples_leaf=100,  # Prevent overfitting with minimum samples per leaf
-                                             class_weight='balanced')  # Balance class weights
-        self.dt_model.fit(X_model, y)
+        # Create the decision tree classifier
+        dt = DecisionTreeClassifier(
+            labelCol=label_col,
+            featuresCol="features",
+            maxDepth=max_depth,
+            minInstancesPerNode=100,  # Prevent overfitting
+            seed=42
+        )
         
-        # Store feature names for rule generation
-        self.feature_names = X_model.columns.tolist()
+        # Create the pipeline
+        pipeline = Pipeline(stages=[assembler, dt])
+        
+        # Train the model
+        self.dt_model = pipeline.fit(sdf)
+        
+        # Extract feature importances
+        tree_model = self.dt_model.stages[-1]
+        self.feature_importances = list(zip(feature_cols, tree_model.featureImportances.toArray()))
+        self.feature_importances.sort(key=lambda x: x[1], reverse=True)
         
         return self.dt_model
     
-    def extract_rules(self, X, y, amount_col='amount', score_col='community_fraud_score_amount_d'):
+    def extract_rules(self, sdf, label_col="is_fraud", amount_col="amount", score_col="community_fraud_score_amount_d"):
         """
         Extract rules from the trained decision tree model.
         
         Parameters:
-        - X: Feature DataFrame used for training
-        - y: Target Series (is_fraud)
+        - sdf: Processed Spark DataFrame
+        - label_col: Name of the target column
         - amount_col: Name of the column containing transaction amounts
         - score_col: Name of the column containing community fraud scores
         
@@ -429,210 +500,121 @@ class FraudRuleGenerator:
         if self.dt_model is None:
             raise ValueError("Model has not been trained yet. Call train_model first.")
         
-        # Get the tree structure in text format
-        tree_rules = export_text(self.dt_model, feature_names=self.feature_names)
+        # Get the decision tree model from the pipeline
+        tree_model = self.dt_model.stages[-1]
         
-        # Parse the tree text to extract decision paths
-        paths = self._parse_tree_text(tree_rules)
+        # Extract decision paths (this requires converting to PMML and parsing, or collecting rules manually)
+        # As Spark doesn't provide direct access to decision paths, we'll use an alternative approach
+        # We'll convert the model to a string representation and extract rules
         
-        # Generate rules from the paths
+        # Since we can't easily extract decision paths from Spark's decision tree model directly,
+        # we'll use model predictions and analyze patterns in the data to construct rules
+        
+        # Add predictions to the DataFrame
+        predictions = self.dt_model.transform(sdf)
+        
+        # Register the DataFrame as a temp view for SQL queries
+        predictions.createOrReplaceTempView("predictions")
+        
+        # Get the important features based on feature importance
+        top_features = [f[0] for f in self.feature_importances[:10]]  # Take top 10 features
+        
+        # Analyze patterns in the data to construct rules
         rules = []
-        for path in paths:
-            # Only keep paths that lead to fraud prediction (class 1)
-            if path['class'] == 1:
-                # Convert the path conditions to a rule
-                rule = self._path_to_rule(path, X, y, amount_col, score_col)
-                if rule:
-                    rules.append(rule)
         
-        # Sort rules by amount_recall (highest first)
+        # For each amount range, generate rules based on important features
+        for i in range(len(self.amount_thresholds) + 1):
+            amount_condition = ""
+            if i == 0:
+                amount_condition = f"amount <= {self.amount_thresholds[0]}"
+            elif i == len(self.amount_thresholds):
+                amount_condition = f"amount > {self.amount_thresholds[-1]}"
+            else:
+                amount_condition = f"amount > {self.amount_thresholds[i-1]} AND amount <= {self.amount_thresholds[i]}"
+            
+            # Find patterns where the model predicts fraud with high confidence
+            patterns_query = f"""
+                SELECT 
+                    {amount_condition} as amount_condition,
+                    {', '.join(top_features)} 
+                FROM predictions
+                WHERE prediction = 1.0 AND probability[1] >= 0.7
+                GROUP BY {amount_condition}, {', '.join(top_features)}
+                HAVING COUNT(*) >= 50
+            """
+            
+            try:
+                patterns = self.spark.sql(patterns_query)
+                
+                if patterns.count() > 0:
+                    # For each pattern, construct a rule
+                    for pattern in patterns.collect():
+                        rule_conditions = [f"({amount_condition})"]
+                        
+                        # Add conditions for important features
+                        for feature in top_features:
+                            value = pattern[feature]
+                            if value is not None and value != -1:  # Skip null or default values
+                                # Handle numeric and categorical features differently
+                                if isinstance(value, (int, float)):
+                                    # For score features, use narrower ranges
+                                    if feature == score_col:
+                                        lower_bound = max(0, value - 0.05)
+                                        upper_bound = min(1, value + 0.05)
+                                        rule_conditions.append(f"event.{feature} >= {lower_bound:.3f} AND event.{feature} < {upper_bound:.3f}")
+                                    else:
+                                        rule_conditions.append(f"event.{feature} = {value}")
+                                else:
+                                    rule_conditions.append(f"event.{feature} = '{value}'")
+                        
+                        # Construct the rule string
+                        rule_string = " AND ".join(rule_conditions)
+                        
+                        # Evaluate the rule
+                        rule_query = f"""
+                            SELECT 
+                                COUNT(*) as num_transactions,
+                                SUM(CAST({label_col} AS INT)) as num_frauds,
+                                SUM(CASE WHEN {label_col} = 1 THEN {amount_col} ELSE 0 END) as captured_fraud_amount
+                            FROM predictions
+                            WHERE {rule_string.replace('event.', '')}
+                        """
+                        
+                        rule_stats = self.spark.sql(rule_query).collect()[0]
+                        
+                        num_transactions = rule_stats["num_transactions"]
+                        num_frauds = rule_stats["num_frauds"]
+                        captured_fraud_amount = rule_stats["captured_fraud_amount"]
+                        
+                        # Calculate precision
+                        precision = num_frauds / num_transactions if num_transactions > 0 else 0
+                        
+                        # Calculate amount recall
+                        total_fraud_amount_query = f"""
+                            SELECT SUM(CASE WHEN {label_col} = 1 THEN {amount_col} ELSE 0 END) as total_fraud_amount
+                            FROM predictions
+                        """
+                        
+                        total_fraud_amount = self.spark.sql(total_fraud_amount_query).collect()[0]["total_fraud_amount"]
+                        amount_recall = captured_fraud_amount / total_fraud_amount if total_fraud_amount > 0 else 0
+                        
+                        # Filter rules with precision below target
+                        if precision >= self.target_precision:
+                            rules.append({
+                                'rule_string': rule_string,
+                                'precision': precision,
+                                'amount_recall': amount_recall,
+                                'num_transactions': num_transactions,
+                                'num_frauds': num_frauds,
+                                'captured_fraud_amount': captured_fraud_amount
+                            })
+            except Exception as e:
+                print(f"Error generating rules for amount range {i}: {str(e)}")
+        
+        # Sort rules by amount recall (highest first)
         rules.sort(key=lambda x: x['amount_recall'], reverse=True)
         
         return rules
-    
-    def _parse_tree_text(self, tree_text):
-        """
-        Parse the text representation of the decision tree to extract paths.
-        
-        Parameters:
-        - tree_text: Text representation of the decision tree
-        
-        Returns:
-        - List of path dictionaries
-        """
-        lines = tree_text.split('\n')
-        paths = []
-        current_path = []
-        
-        for line in lines:
-            if not line.strip():
-                continue
-                
-            # Calculate the depth by counting leading spaces (divided by 4)
-            depth = (len(line) - len(line.lstrip())) // 4
-            
-            # If we're going back up the tree, remove deeper nodes from current path
-            if depth < len(current_path):
-                current_path = current_path[:depth]
-            
-            # Parse the node content
-            content = line.strip()
-            
-            if 'class:' in content:
-                # Leaf node with class prediction
-                class_val = int(content.split('class:')[1].strip())
-                
-                # Create a copy of the current path and add the class
-                path_copy = current_path.copy()
-                paths.append({
-                    'conditions': path_copy,
-                    'class': class_val
-                })
-            else:
-                # Decision node with feature test
-                if '<=' in content:
-                    feature, value = content.split('<=')
-                    current_path.append((feature.strip(), '<=', float(value.strip())))
-                elif '>' in content:
-                    feature, value = content.split('>')
-                    current_path.append((feature.strip(), '>', float(value.strip())))
-        
-        return paths
-    
-    def _path_to_rule(self, path, X, y, amount_col, score_col):
-        """
-        Convert a decision path to a rule and evaluate its performance.
-        
-        Parameters:
-        - path: Dictionary containing the path conditions and predicted class
-        - X: Feature DataFrame
-        - y: Target Series (is_fraud)
-        - amount_col: Name of the column containing transaction amounts
-        - score_col: Name of the column containing community fraud scores
-        
-        Returns:
-        - Rule dictionary with conditions and performance metrics
-        """
-        # Create a mask to identify transactions matching all conditions
-        mask = pd.Series(True, index=X.index)
-        amount_conditions = []
-        score_conditions = []
-        other_conditions = []
-        
-        for feature, op, value in path['conditions']:
-            # Check if this is an amount range feature
-            if feature.startswith('amount_range_'):
-                # Find the corresponding amount thresholds
-                range_idx = int(feature.split('_')[-1])
-                
-                if range_idx == 0:
-                    # amount <= first threshold
-                    amount_conditions.append(f"(event.{amount_col} <= {self.amount_thresholds[0]})")
-                    if op == '<=':
-                        if value < 0.5:  # False
-                            mask &= ~(X[amount_col] <= self.amount_thresholds[0])
-                        else:  # True
-                            mask &= (X[amount_col] <= self.amount_thresholds[0])
-                    else:  # '>'
-                        if value > 0.5:  # True
-                            mask &= (X[amount_col] <= self.amount_thresholds[0])
-                        else:  # False
-                            mask &= ~(X[amount_col] <= self.amount_thresholds[0])
-                            
-                elif range_idx == len(self.amount_thresholds):
-                    # amount > last threshold
-                    amount_conditions.append(f"(event.{amount_col} > {self.amount_thresholds[-1]})")
-                    if op == '<=':
-                        if value < 0.5:  # False
-                            mask &= ~(X[amount_col] > self.amount_thresholds[-1])
-                        else:  # True
-                            mask &= (X[amount_col] > self.amount_thresholds[-1])
-                    else:  # '>'
-                        if value > 0.5:  # True
-                            mask &= (X[amount_col] > self.amount_thresholds[-1])
-                        else:  # False
-                            mask &= ~(X[amount_col] > self.amount_thresholds[-1])
-                else:
-                    # amount > previous threshold and <= current threshold
-                    lower = self.amount_thresholds[range_idx-1]
-                    upper = self.amount_thresholds[range_idx]
-                    amount_conditions.append(f"(event.{amount_col} > {lower} and event.{amount_col} <= {upper})")
-                    
-                    if op == '<=':
-                        if value < 0.5:  # False
-                            mask &= ~((X[amount_col] > lower) & (X[amount_col] <= upper))
-                        else:  # True
-                            mask &= ((X[amount_col] > lower) & (X[amount_col] <= upper))
-                    else:  # '>'
-                        if value > 0.5:  # True
-                            mask &= ((X[amount_col] > lower) & (X[amount_col] <= upper))
-                        else:  # False
-                            mask &= ~((X[amount_col] > lower) & (X[amount_col] <= upper))
-            
-            # Handle original features
-            elif feature in X.columns:
-                if feature == score_col:
-                    # For score features, we create a separate condition
-                    if op == '<=':
-                        score_conditions.append(f"event.{feature} < {value:.3f}")
-                        mask &= (X[feature] <= value)
-                    else:  # '>'
-                        score_conditions.append(f"event.{feature} >= {value:.3f}")
-                        mask &= (X[feature] > value)
-                else:
-                    # For other features
-                    if op == '<=':
-                        other_conditions.append(f"event.{feature} <= {value}")
-                        mask &= (X[feature] <= value)
-                    else:  # '>'
-                        other_conditions.append(f"event.{feature} > {value}")
-                        mask &= (X[feature] > value)
-        
-        # If no transactions match the conditions, return None
-        if not mask.any():
-            return None
-        
-        # Evaluate rule performance
-        matches = X[mask]
-        true_positives = y[mask].sum()
-        precision = true_positives / len(matches) if len(matches) > 0 else 0
-        
-        # Calculate amount recall (sum of fraud amounts captured / total fraud amounts)
-        total_fraud_amount = (X[y == 1][amount_col]).sum()
-        captured_fraud_amount = (matches[y[mask] == 1][amount_col]).sum()
-        amount_recall = captured_fraud_amount / total_fraud_amount if total_fraud_amount > 0 else 0
-        
-        # Skip rules with precision below target
-        if precision < self.target_precision:
-            return None
-        
-        # Format the rule as a string similar to the example
-        rule_components = []
-        
-        # Add amount and score conditions together
-        if amount_conditions and score_conditions:
-            score_parts = []
-            for amt_cond in amount_conditions:
-                for score_cond in score_conditions:
-                    score_parts.append(f"{amt_cond} and {score_cond}")
-            
-            if score_parts:
-                rule_components.append("(" + " or ".join(score_parts) + ")")
-        
-        # Add other conditions
-        rule_components.extend(other_conditions)
-        
-        # Combine all parts with 'and'
-        rule_str = " and ".join(rule_components)
-        
-        return {
-            'rule_string': rule_str,
-            'precision': precision,
-            'amount_recall': amount_recall,
-            'num_transactions': len(matches),
-            'num_frauds': true_positives,
-            'captured_fraud_amount': captured_fraud_amount
-        }
     
     def generate_optimized_ruleset(self, rules, max_rules=5):
         """
@@ -651,8 +633,44 @@ class FraudRuleGenerator:
         # Select top rules up to max_rules
         selected_rules = sorted_rules[:max_rules]
         
+        # Format the score ranges in the amount conditions
+        formatted_rules = []
+        for rule in selected_rules:
+            # Parse the rule string
+            rule_parts = rule['rule_string'].split(' AND ')
+            formatted_parts = []
+            
+            for part in rule_parts:
+                # Handle community_fraud_score ranges
+                if "community_fraud_score_amount_d" in part and ">=" in part and "AND" in part and "<" in part:
+                    # Extract the bounds
+                    lower_bound = float(part.split(">=")[1].split("AND")[0].strip())
+                    upper_bound = float(part.split("<")[1].strip())
+                    formatted_parts.append(f"event.community_fraud_score_amount_d >= {lower_bound:.3f} AND event.community_fraud_score_amount_d < {upper_bound:.3f}")
+                # Handle amount ranges
+                elif "amount" in part and ">" in part and "<=" in part:
+                    # Extract the bounds
+                    lower_bound = float(part.split(">")[1].split("AND")[0].strip())
+                    upper_bound = float(part.split("<=")[1].strip())
+                    formatted_parts.append(f"event.amount > {lower_bound} AND event.amount <= {upper_bound}")
+                elif "amount" in part and "<=" in part:
+                    # Extract the bound
+                    upper_bound = float(part.split("<=")[1].strip())
+                    formatted_parts.append(f"event.amount <= {upper_bound}")
+                elif "amount" in part and ">" in part:
+                    # Extract the bound
+                    lower_bound = float(part.split(">")[1].strip())
+                    formatted_parts.append(f"event.amount > {lower_bound}")
+                else:
+                    # Keep other conditions as is, but replace any "event." prefixes
+                    formatted_parts.append(part if part.startswith("event.") else f"event.{part}")
+            
+            # Join the formatted parts
+            formatted_rule = " AND ".join(formatted_parts)
+            formatted_rules.append(formatted_rule)
+        
         # Combine rules into a single ruleset with 'or' operator
-        combined_rule = " or ".join([f"({rule['rule_string']})" for rule in selected_rules])
+        combined_rule = " OR ".join([f"({rule})" for rule in formatted_rules])
         
         # Calculate the performance metrics for the combined ruleset
         total_captured_amount = sum(rule['captured_fraud_amount'] for rule in selected_rules)
@@ -674,62 +692,127 @@ class FraudRuleGenerator:
         
         return ruleset
 
-# Example usage
-def example_workflow():
-    # Load sample data (replace with your actual data loading)
-    # df = pd.read_csv('fraud_transactions.csv')
+# Example usage in a Spark environment
+def example_spark_workflow():
+    """
+    Example workflow for using the SparkFraudRuleGenerator with sample data.
+    """
+    # Initialize Spark session
+    spark = SparkSession.builder \
+        .appName("FraudRuleGeneratorExample") \
+        .config("spark.sql.session.timeZone", "UTC") \
+        .getOrCreate()
     
     # For demonstration, creating a synthetic dataset
-    np.random.seed(42)
-    n_samples = 10000
+    # In a real environment, you would load your data from storage
+    # For example: sdf = spark.read.parquet("hdfs:///path/to/fraud/data")
     
-    df = pd.DataFrame({
-        'fraud_score': np.random.uniform(0, 100, n_samples),
-        'is_fraud': np.random.binomial(1, 0.1, n_samples),  # 10% fraud rate
-        'amount': np.random.exponential(5000, n_samples),  # Transaction amounts
-        'community_fraud_score_amount_d': np.random.uniform(0, 1, n_samples),  # Fraud score
-        'mch_id_trimmed': np.random.choice(['0160859', '0245789', '0389012'], n_samples),
-        'issuer_member': np.random.choice(['20041', '30567', '45678'], n_samples),
-        'panalias_hab_cp_bill_count_45d': np.random.randint(0, 5, n_samples),
-        'panalias_hab_ipaddress_count_4': np.random.randint(0, 10, n_samples),
-        'ship_address_usage_ind': np.random.choice(['01', '02', '03', '04', '05'], n_samples),
-        'isres_dpt_estimated_fact': np.random.randint(0, 2, n_samples),
-        'is_correct_bill_dept': np.random.choice([True, False], n_samples),
-        'card_profile_dep': np.random.choice(['0', '1', '2', '3', '4', 'nan', ''], n_samples)
-    })
+    # Create a sample dataframe with random data
+    import random
+    from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, BooleanType
     
-    # Scale the fraud likelihood based on the fraud_score
-    df['is_fraud'] = np.where(
-        (df['fraud_score'] >= 70), 
-        np.random.binomial(1, 0.8, n_samples),  # 80% chance of fraud if score >= 70
-        np.where(
-            (df['fraud_score'] >= 50) & (df['fraud_score'] < 70),
-            np.random.binomial(1, 0.3, n_samples),  # 30% chance of fraud if score in [50,70)
-            np.random.binomial(1, 0.05, n_samples)  # 5% chance of fraud otherwise
-        )
-    )
+    # Define schema
+    schema = StructType([
+        StructField("fraud_score", DoubleType(), True),
+        StructField("is_fraud", IntegerType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("community_fraud_score_amount_d", DoubleType(), True),
+        StructField("mch_id_trimmed", StringType(), True),
+        StructField("issuer_member", StringType(), True),
+        StructField("panalias_hab_cp_bill_count_45d", IntegerType(), True),
+        StructField("panalias_hab_ipaddress_count_4", IntegerType(), True),
+        StructField("ship_address_usage_ind", StringType(), True),
+        StructField("isres_dpt_estimated_fact", IntegerType(), True),
+        StructField("is_correct_bill_dept", BooleanType(), True),
+        StructField("card_profile_dep", StringType(), True),
+        StructField("merchant_country_code", StringType(), True),
+        StructField("trans_status", StringType(), True),
+        StructField("three_ds_mode", StringType(), True)
+    ])
+    
+    # Generate sample data
+    n_samples = 100000  # Use a larger number in production
+    
+    # Create merchant and issuer IDs
+    merchant_ids = [f"MERCH{i:06d}" for i in range(1000)]
+    issuer_ids = [f"ISS{i:05d}" for i in range(200)]
+    countries = ["FR", "US", "UK", "DE", "ES", "IT", "JP", "CN", "AU", "BR"]
+    ship_inds = ["01", "02", "03", "04", "05"]
+    
+    # Generate random data
+    data = []
+    for _ in range(n_samples):
+        fraud_score = random.uniform(0, 100)
+        
+        # Set fraud label based on score (higher score = higher fraud probability)
+        if fraud_score >= 70:
+            is_fraud = 1 if random.random() < 0.8 else 0  # 80% chance of fraud if score >= 70
+        elif 50 <= fraud_score < 70:
+            is_fraud = 1 if random.random() < 0.3 else 0  # 30% chance of fraud if score in [50,70)
+        else:
+            is_fraud = 1 if random.random() < 0.05 else 0  # 5% chance of fraud otherwise
+        
+        # Generate amount with exponential distribution (higher amounts are less common)
+        amount = random.expovariate(1/5000)  # Mean of 5000
+        
+        # Community fraud score correlated with is_fraud
+        base_score = random.uniform(0.5, 0.9) if is_fraud else random.uniform(0.1, 0.7)
+        community_score = min(max(base_score + random.uniform(-0.1, 0.1), 0), 1)
+        
+        # Random categorical values
+        mch_id = random.choice(merchant_ids)
+        issuer_member = random.choice(issuer_ids)
+        ship_address_usage_ind = random.choice(ship_inds)
+        merchant_country = random.choice(countries)
+        issuer_country = random.choice(countries)
+        
+        # Transaction status - higher rejection rate for fraud
+        trans_status = "N" if (is_fraud and random.random() < 0.4) else "Y"
+        
+        # 3DS mode - more likely for higher risk transactions
+        three_ds_mode = random.choice(["N", "C", "F"]) if fraud_score < 50 else random.choice(["C", "F", "F", "F"])
+        
+        # Other features
+        bill_count = random.randint(0, 5)
+        ip_count = random.randint(0, 10)
+        is_dpt_estimated = random.randint(0, 1)
+        is_correct_bill = random.choice([True, False])
+        card_profile_dep = random.choice(["0", "1", "2", "3", "4", "nan", ""])
+        
+        # Add the row
+        data.append((
+            fraud_score, is_fraud, amount, community_score, mch_id, issuer_member,
+            bill_count, ip_count, ship_address_usage_ind, is_dpt_estimated,
+            is_correct_bill, card_profile_dep, merchant_country, trans_status, three_ds_mode
+        ))
+    
+    # Create Spark DataFrame
+    sdf = spark.createDataFrame(data, schema)
     
     # Initialize the rule generator
-    generator = FraudRuleGenerator(min_score=50, max_score=70, target_precision=0.3)
+    generator = SparkFraudRuleGenerator(min_score=50, max_score=70, target_precision=0.3)
     
     # Identify categorical and ID features
-    categorical_features = ['ship_address_usage_ind']
+    categorical_features = ['ship_address_usage_ind', 'card_profile_dep']
     id_features = ['mch_id_trimmed', 'issuer_member']
     
     # Preprocess the data
-    processed_df = generator.preprocess_data(df, 
-                                            categorical_features=categorical_features, 
-                                            id_features=id_features)
-    
-    # Split into features and target
-    X = processed_df.drop('is_fraud', axis=1)
-    y = processed_df['is_fraud']
+    processed_sdf = generator.preprocess_data(
+        sdf,
+        categorical_features=categorical_features,
+        id_features=id_features
+    )
     
     # Train the model
-    generator.train_model(X, y, amount_col='amount', max_depth=4)
+    generator.train_model(processed_sdf, label_col="is_fraud", amount_col="amount", max_depth=4)
     
     # Extract rules
-    rules = generator.extract_rules(X, y, amount_col='amount', score_col='community_fraud_score_amount_d')
+    rules = generator.extract_rules(
+        processed_sdf,
+        label_col="is_fraud",
+        amount_col="amount",
+        score_col="community_fraud_score_amount_d"
+    )
     
     # Generate optimized ruleset
     ruleset = generator.generate_optimized_ruleset(rules, max_rules=3)
@@ -743,4 +826,4 @@ def example_workflow():
     return ruleset
 
 if __name__ == "__main__":
-    example_workflow()
+    example_spark_workflow()
